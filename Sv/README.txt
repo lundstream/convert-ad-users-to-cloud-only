@@ -1,142 +1,291 @@
-========================================================
-  Convert AD-användare till Cloud-Only (Entra ID)
-========================================================
+﻿================================================================
+  Konvertera AD-användare till Cloud-Only (Entra ID)
+  Svensk version
+================================================================
 
-VAD VERKTYGET GÖR
------------------
-Konverterar en AD-synkad användare till ett fristående
-molnkonto i Entra ID (Azure AD) genom att:
+ÖVERSIKT
+--------
+Verktyget konverterar en AD-synkad användare till ett fristående
+molnkonto i Entra ID (Azure AD). Det är ett WPF-gränssnitt byggt
+på Windows PowerShell 5.1 som driver hela flödet från en plats:
+AD, Azure AD Connect och Microsoft Graph.
 
-  1. Flytta AD-kontot till ett icke-synkat OU
-  2. Köra en delta-synk → kontot tas bort i Entra ID
-  3. Pausa synkschema
-  4. Återställa kontot i Entra ID
-  5. Rensa onPremisesImmutableId via Graph API
-  6. Återaktivera synkschema och köra en ny delta-synk
+Två lägen stöds:
+
+  - Enskild användare  - konvertera en användare i taget
+  - Bulk               - läsa in en CSV och köra många i följd
+
+Kryssrutan "Dry run" är aktiverad som standard så att du kan
+verifiera inställningar och se hela loggutdatat utan att något
+ändras i AD eller Entra ID.
+
+
+SÅ FUNGERAR DET (per användare)
+-------------------------------
+För varje användare kör verktyget sex sekventiella steg:
+
+  [1/6]  FLYTTA I AD
+         - Hämtar AD-objektet och exporterar alla attribut till
+           en XML-fil (säkerhetskopia före flytt) i loggmappen.
+         - Flyttar kontot till det konfigurerade icke-synkade OU:t
+           så att AAD Connect behandlar det som utanför sync-omfång.
+
+  [2/6]  DELTA-SYNK + PAUS
+         - Ansluter till Azure AD Connect-servern via WinRM.
+         - Väntar in eventuell pågående synkcykel.
+         - Inaktiverar synkschemat, kör en Delta-synk så att den
+           nu utanförstående användaren soft-delete:as i Entra ID,
+           och väntar tills cykeln är klar.
+
+  [3/6]  ANSLUT TILL GRAPH
+         - Interaktiv inloggning (Connect-MgGraph) med scopet
+           User.ReadWrite.All.
+
+  [4/6]  HITTA + ÅTERSTÄLL RADERAD ANVÄNDARE
+         - Söker i papperskorgen med tre strategier:
+             1. Exakt UPN-matchning
+             2. Exakt local-part (före '@')
+             3. Fuzzy "contains" på UPN och Mail (hanterar
+                Entras soft-delete-format
+                {guid}originalnamn@domain)
+         - Om ingen matchning hittas körs en ny Delta-synk och
+           försöket görs om (upp till 5 försök, ~30 s mellan).
+         - Återställer matchad användare via objekt-Id och väntar
+           på att Entra ska indexera om.
+
+  [5/6]  RENSA ImmutableId
+         - Läser den återställda användaren via Id (UPN kan ändras
+           vid återställning).
+         - Om den aktuella UPN:en ligger i en federerad/verifierad
+           domän byts den tillfälligt till
+           <localpart>@<managed-domain> så att ImmutableId-skrivningen
+           lyckas, och byts sedan tillbaka.
+         - PATCH:ar onPremisesImmutableId = null via Graph.
+         - Verifierar att attributet är tomt.
+
+  [6/6]  ÅTERUPPTA SYNK
+         - Aktiverar AAD Connects synkschema igen och startar en
+           avslutande Delta-synk.
+
 
 KRAV
 ----
-  - Windows PowerShell 5.1 (körs som administratör)
-  - RSAT: Active Directory DS Tools installerat
-    (Inställningar → Appar → Valfria funktioner)
-  - Microsoft.Graph PowerShell-modul
-    (installeras via Install-Prerequisites.ps1)
-  - Nätverksåtkomst (WinRM) till Azure AD Connect-servern
-  - Behörighet: User Administrator eller Global Administrator i Entra ID
-  - AD-behörighet att flytta användare mellan OU:n
+Dator som kör verktyget:
+  - Windows 10/11 eller Windows Server 2016+
+  - Windows PowerShell 5.1 (INTE PowerShell 7)
+  - Körs som administratör
+  - RSAT: Active Directory DS Tools
+  - Microsoft.Graph-moduler v2+:
+      Microsoft.Graph.Authentication
+      Microsoft.Graph.Users
+      Microsoft.Graph.Identity.DirectoryManagement
+  - WinRM-åtkomst till AAD Connect-servern
 
-FÖRBEREDELSER (kör en gång per server)
---------------------------------------
-  Högerklicka på Install-Prerequisites.ps1 → Kör som administratör
+Identitet:
+  - Entra-roll: User Administrator eller Global Administrator
+  - AD-rättighet att läsa och flytta användarobjektet
+  - Konto med adminåtkomst på AAD Connect-servern
 
-  Skriptet installerar automatiskt de moduler som saknas:
-    - Microsoft.Graph (Authentication, Users, Identity.DirectoryManagement)
-    - NuGet-provider (krävs av PowerShellGet)
-    - RSAT: Active Directory DS Tools (om det saknas)
+Nätverk:
+  - Utgående HTTPS till graph.microsoft.com och
+    login.microsoftonline.com
+  - TCP 5985/5986 (WinRM) till AAD Connect-servern
 
-  På servrar MED internet hämtas allt direkt från PSGallery.
-  På servar UTAN internet, kör Download-Prerequisites.ps1 på en
-  internetansluten dator/server först och kopiera mappen Offline-Packages\
-  hit — Install-Prerequisites.ps1 känner av detta automatiskt.
+
+INSTALLATION
+------------
+En gång per dator:
+
+  1. Högerklicka Install-Prerequisites.ps1 -> Kör som administratör
+     Skriptet installerar:
+       - NuGet package provider
+       - Microsoft.Graph-moduler (Authentication, Users,
+         Identity.DirectoryManagement)
+       - RSAT: Active Directory DS Tools (frågar J/N)
+     Om mappen Offline-Packages\ finns bredvid skriptet
+     installeras från den i stället för från PSGallery.
+
+  2. Verifiera att sammanfattningen i slutet rapporterar [OK]
+     för samtliga poster.
+
+
+LUFTGAPAD / OFFLINE-INSTALLATION
+--------------------------------
+Används när måldatorn saknar internetåtkomst.
+
+  Steg A - på en internetansluten dator
+     Högerklicka Download-Prerequisites.ps1 ->
+     Kör som administratör
+     Skapar mappen Offline-Packages\ med:
+       - NuGet provider-DLL
+       - Uppdaterad PowerShellGet
+       - Samtliga tre Microsoft.Graph-moduler (med beroenden)
+       - manifest.json (metadata om paketet)
+
+  Steg B - på måldatorn
+     Kopiera mappen Offline-Packages\ bredvid
+     Install-Prerequisites.ps1.
+     Högerklicka Install-Prerequisites.ps1 ->
+     Kör som administratör.
+     Skriptet:
+       - Installerar NuGet-providern från paketet
+       - Registrerar en tillfällig lokal PSRepository
+       - Installerar Graph-modulerna därifrån
+       - Avregistrerar repositoriet
+       - Erbjuder RSAT-installation (kan inte paketeras som modul)
+
+  Obs! GUI:t kan också själv-installera Microsoft.Graph vid
+  körning om modulerna saknas och internet finns.
+
 
 KOM IGÅNG
 ---------
-  1. Högerklicka på Launch-GUI.bat → Kör som administratör
-  2. Gå till fliken "Inställningar" och fyll i:
-       - Mål-OU: det OU dit AD-kontot ska flyttas (icke-synkat)
-       - AAD Connect-server: hostname till din sync-server
-       - Managed domain-suffix: din onmicrosoft.com-domän
-       - Loggmapp: var XML-säkerhetskopior sparas
-  3. Klicka "Spara inställningar"
+  1. Högerklicka Launch-GUI.bat -> Kör som administratör.
 
-ENSKILD ANVÄNDARE
------------------
-  1. Välj fliken "Enskild användare"
-  2. Fyll i sAMAccountName (AD-inloggning) och UPN (Entra ID)
-  3. Avmarkera "Dry run" när du är redo att köra på riktigt
-  4. Klicka "Kör konvertering"
-  5. Ange autentisering för sync-servern när dialogrutan visas
-  6. Följ förloppet i loggrutan längst ned
+  2. Under fliken "Inställningar", fyll i:
 
-BULK (CSV-FIL)
---------------
-  1. Skapa en CSV-fil med rubrikrad:
-       sAMAccountName,UPN
-       john.doe,john.doe@contoso.com
-       jane.smith,jane.smith@contoso.com
+       Mål-OU                    DN till ett icke-synkat OU, t.ex.
+                                 OU=Disabled Objects,DC=contoso,DC=com
 
-     (Se example-users.csv som mall)
+       AAD Connect-server        Hostname eller FQDN till sync-servern,
+                                 t.ex. azadc.contoso.com
 
-  2. Välj fliken "Bulk (CSV-fil)"
-  3. Klicka "Välj CSV-fil..." och välj din fil
-  4. Klicka "Ladda" – användarna visas i listan
-  5. Avmarkera "Dry run" när du är redo
-  6. Klicka "Kör alla"
-  7. Status per användare visas i kolumnen till höger (OK / FEL)
+       Managed domain-suffix     Din onmicrosoft.com-domän (icke-federerad),
+                                 t.ex. contoso.onmicrosoft.com
+                                 Används som tillfällig UPN vid rensning
+                                 av ImmutableId om användaren ligger på
+                                 en federerad domän.
+
+       Loggmapp                  Mapp för XML-säkerhetskopior och logg.
+                                 Standard:
+                                 %USERPROFILE%\Documents\CloudOnly-Logs
+
+       Synk-väntetid             Sekunder att vänta efter Delta-synk
+                                 innan papperskorgen frågas
+                                 (standard 180).
+
+       Återställningstid         Sekunder att vänta efter återställning
+                                 innan fler Graph-anrop (standard 20).
+
+  3. Klicka "Spara inställningar".
+     Inställningarna skrivs till Convert-to-CloudOnly-Settings.json
+     bredvid skriptet.
+
+
+LÄGE: ENSKILD ANVÄNDARE
+-----------------------
+  1. Välj fliken "Enskild användare".
+  2. Fyll i:
+       sAMAccountName   AD-inloggningsnamn (utan domän).
+       UPN              Användarens UserPrincipalName i Entra ID.
+  3. Låt "Dry run" vara ikryssad för generalrepetition, eller
+     avmarkera för att köra på riktigt.
+  4. Klicka "Kör konvertering".
+  5. Ange autentisering till AAD Connect-servern i dialogen.
+  6. Logga in mot Microsoft Graph i webbläsaren som öppnas.
+  7. Följ förloppet i loggrutan. Vid lyckat resultat blir statusen
+     grön ("Klar!"); vid misslyckande röd ("Fel - se logg").
+
+
+LÄGE: BULK (CSV)
+----------------
+  1. Förbered en CSV med rubrikraden:
+
+         sAMAccountName,UPN
+         john.doe,john.doe@contoso.com
+         jane.smith,jane.smith@contoso.com
+
+     (Se example-users.csv bredvid skriptet.)
+
+  2. Välj fliken "Bulk (CSV-fil)".
+  3. Klicka "Välj CSV-fil..." och välj filen.
+  4. Klicka "Ladda". Användare visas i listan med Status = "-".
+  5. Avmarkera "Dry run" när du är klar.
+  6. Klicka "Kör alla".
+  7. Varje rad ändras från Kör... -> OK / FEL medan verktyget
+     arbetar. Slutsammanfattningen visar antal lyckade.
+
+  Kolumnaliasen SamAccountName och UserPrincipalName accepteras.
+
 
 DRY RUN
 -------
-Dry run är aktiverat som standard. Ingenting ändras i AD
-eller Entra ID – alla steg loggas som om de körts på riktigt.
-Använd detta för att verifiera inställningar innan du kör skarpt.
+Dry Run är aktiverad som standard. I Dry Run:
+
+  - Ingen AD-flytt, ingen synkkörning, ingen Graph-återställning,
+    ingen ImmutableId-ändring.
+  - Alla sex steg loggas som om de hade körts.
+  - Autentisering till sync-servern efterfrågas INTE.
+
+Använd Dry Run för att verifiera Mål-OU, sync-servernamn och
+managed domain-suffix innan skarp körning.
+
 
 LOGG OCH SÄKERHETSKOPIA
-------------------------
-För varje konverterad användare sparas en XML-fil med
-AD-kontots alla attribut i loggmappen (inställningsbar).
-Filerna döps till: <sAMAccountName>_AD_pre-move_<datum>.xml
+-----------------------
+  - En levande färgkodad logg visas i panelen längst ned i GUI:t.
+  - För varje AD-konto exporteras:
+        <Loggmapp>\<sAMAccountName>_AD_pre-move_<yyyyMMdd_HHmmss>.xml
+    Filen är en fullständig Export-Clixml av användarobjektet och
+    kan granskas eller spelas upp igen med Import-Clixml.
+  - Inställningar lagras i Convert-to-CloudOnly-Settings.json.
 
-SERVRAR UTAN INTERNETUPPKOPPLING
------------------------------
-Används verktyget på en server utan internetåtkomst behöver du
-köra de två hjälpskripten i ordning:
-
-  Steg A – på en dator/server MED internet:
-    Högerklicka på Download-Prerequisites.ps1 → Kör som administratör
-
-    Skriptet laddar ned och sparar till mappen Offline-Packages\:
-      1. NuGet-provider DLL
-      2. PowerShellGet (uppdaterad)
-      3. Microsoft.Graph.Authentication  (v2+)
-         Microsoft.Graph.Users
-         Microsoft.Graph.Identity.DirectoryManagement
-      4. Instruktioner för RSAT (kan inte paketers som PS-modul)
-
-    Kopiera hela mappen Offline-Packages\ till målservern.
-
-  Steg B – på MÅLSERVERN (offline):
-    Högerklicka på Install-Prerequisites.ps1 → Kör som administratör
-
-    Skriptet:
-      1. Installerar NuGet-provider från Offline-Packages\NuGetProvider\
-      2. Registrerar Offline-Packages\Modules\ som tillfällig PSRepository
-      3. Installerar de tre Graph-modulerna från den lokala repot
-         (fallback: kopierar modulkataloger direkt till WindowsPowerShell\Modules)
-      4. Installerar RSAT Active Directory-verktyg:
-           - Windows Server:  Install-WindowsFeature RSAT-AD-PowerShell
-           - Windows 10/11:   Add-WindowsCapability (Rsat.ActiveDirectory…)
-      5. Avregistrerar den tillfälliga PSRepository
-      6. Verifierar att alla moduler är tillgängliga
-
-    Starta om verktyget efter att skriptet slutförts.
-
-  Obs! Moduler kan även installeras med internet direkt från GUI:t om
-  Microsoft.Graph saknas – en prompt visas automatiskt.
 
 FELSÖKNING
 ----------
-  - "ActiveDirectory-modulen hittades inte"
-    → Installera RSAT: Active Directory DS Tools via
-      Inställningar → Appar → Valfria funktioner
-      eller kör Install-Prerequisites.ps1 (se ovan)
+"ActiveDirectory-modulen hittades inte"
+   Installera RSAT via Inställningar -> Appar -> Valfria funktioner,
+   eller kör Install-Prerequisites.ps1.
 
-  - "Microsoft.Graph-modulen saknas"
-    → Verktyget försöker installera automatiskt, men om det
-      misslyckas, kör manuellt:
-      Install-Module Microsoft.Graph -Scope CurrentUser
-      eller använd Install-Prerequisites.ps1 för offline-installation
+"Microsoft.Graph-modulen saknas"
+   Verktyget försöker installera automatiskt. Om det misslyckas,
+   kör manuellt:
+     Install-Module Microsoft.Graph -Scope CurrentUser
+   eller använd Install-Prerequisites.ps1 (stöder offline).
 
-  - Fönstret öppnas inte alls
-    → Kontrollera att Launch-GUI.bat körs som administratör
-      och att ExecutionPolicy tillåter skript:
-      Set-ExecutionPolicy RemoteSigned -Scope CurrentUser
+"Get-ADUser är inte känt" i verktyget
+   Innebär oftast att ActiveDirectory-modulen inte är installerad
+   för kontot som kör GUI:t. Installera RSAT och starta om.
+
+"Ingen raderad användare hittades för UPN ..."
+   Delta-synken har ännu inte soft-delete:at användaren. Verktyget
+   gör nya försök med ytterligare synkkörningar, men kontrollera:
+     - Att användaren verkligen ligger i Mål-OU:t.
+     - Att OU:t är uteslutet från AAD Connects sync-omfång.
+     - Att inget synkroniseringsfel rapporteras på AAD Connect-servern
+       (Synchronization Service Manager -> Operations).
+
+"Flera poster matchar local-part ..."
+   Det finns mer än en post i papperskorgen med samma local-part.
+   Ange en mer specifik UPN (fullständig e-postadress) på fliken
+   Enskild användare.
+
+"Failed to change UPN" / fel kring federerad domän
+   Kontrollera att managed domain-suffix är satt till en verifierad
+   icke-federerad onmicrosoft.com-domän på din tenant.
+
+Fönstret öppnas inte
+   Kontrollera att Launch-GUI.bat körs som administratör och att
+   ExecutionPolicy tillåter skript:
+     Set-ExecutionPolicy RemoteSigned -Scope CurrentUser
+
+
+SÄKERHETSANMÄRKNINGAR
+---------------------
+  - GUI:t lagrar aldrig AAD Connect-autentiseringen; den finns
+    bara i minnet under PSSessionens livstid.
+  - Graph-autentiseringen använder interaktiv broker och respekterar
+    Conditional Access / MFA.
+  - XML-säkerhetskopiorna i loggmappen innehåller känsliga attribut
+    (bl.a. mail, telefon, manager-referenser). Skydda mappen med
+    NTFS-ACL:er anpassade till er miljö.
+
+
+FILER
+-----
+  Convert-to-CloudOnly-GUI.ps1   Huvudsakligt GUI och konverteringslogik
+  Install-Prerequisites.ps1      Installerar moduler och RSAT
+  Download-Prerequisites.ps1     Bygger offline-paketet
+  Launch-GUI.bat                 Startar GUI:t med -Sta -NoProfile
+  example-users.csv              Mall för bulkläge
+  README.txt                     Denna fil
