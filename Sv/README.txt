@@ -109,7 +109,7 @@ En gång per dator:
      för samtliga poster.
 
 
-LUFTGAPAD / OFFLINE-INSTALLATION
+OFFLINE-INSTALLATION
 --------------------------------
 Används när måldatorn saknar internetåtkomst.
 
