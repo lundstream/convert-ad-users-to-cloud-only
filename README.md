@@ -4,6 +4,8 @@ A Windows PowerShell 5.1 WPF GUI tool for converting AD-synced users into standa
 
 Available in **English** ([`En/`](En/)) and **Swedish** ([`Sv/`](Sv/)).
 
+![GUI screenshot](Screenshot/Screenshot.png)
+
 ## What it does
 
 For each user, the tool performs these steps:
